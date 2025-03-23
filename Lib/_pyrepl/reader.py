@@ -344,17 +344,64 @@ class Reader:
         del last_refresh_line_end_offsets[num_common_lines:]
 
         pos = self.pos
-        pos -= offset
 
         prompt_from_cache = (offset and self.buffer[offset - 1] != "\n")
 
-        lines = "".join(self.buffer[offset:]).split("\n")
+        
+        pos -= offset
 
         cursor_found = False
         lines_beyond_cursor = 0
-        for ln, line in enumerate(lines, num_common_lines):
-            ll = len(line)
-            if 0 <= pos <= ll:
+        l = None
+        l2 = None
+        ln = num_common_lines
+        def _get_next_line():
+            lines = "".join(self.buffer[offset:]).split("\n")
+            for line in lines:
+                yield line
+        def _get_next_prompt():
+            while True:
+                prompt = self.get_prompt(ln, False)
+                prompt = prompt[ln * self.console.width : (ln + 1) * self.console.width]
+                if len(prompt) == 0:
+                    break
+                prompts = prompt.split("\n")
+                for prompt in prompts[:-1]:
+                    prompt, lp = self.process_prompt(prompt)
+                    yield True, prompt, lp
+                prompt, lp = self.process_prompt(prompts[-1])
+                yield False, prompt, lp
+        get_next_line = _get_next_line()
+        get_next_prompt = _get_next_prompt()
+        has_more_line = True
+        has_more_prompt = True
+        lines_beyond_cursor = 0
+        while True:
+            if not l2:
+                try:
+                    line = next(get_next_line)
+                    l, l2 = disp_str(line)
+                except StopIteration:
+                    has_more_line = False
+            try:
+                prompt_only, prompt, lp = next(get_next_prompt)
+            except StopIteration:
+                prompt = ""
+                lp = 0
+                has_more_prompt = False
+                prompt_only = False
+            if not has_more_prompt and not has_more_line:
+                break
+
+            index_to_wrap_before = 0
+            if not prompt_only: 
+                column = 0
+                for character_width in l2:
+                    if column + character_width >= self.console.width - lp:
+                        break
+                    index_to_wrap_before += 1
+                    column += character_width
+            if offset <= pos <= offset + index_to_wrap_before:
                 self.lxy = pos, ln
                 cursor_found = True
             elif cursor_found:
@@ -363,52 +410,13 @@ class Reader:
                     # No need to keep formatting lines.
                     # The console can't show them.
                     break
-            if prompt_from_cache:
-                # Only the first line's prompt can come from the cache
-                prompt_from_cache = False
-                prompt = ""
-            else:
-                prompt = self.get_prompt(ln, ll >= pos >= 0)
-            while "\n" in prompt:
-                pre_prompt, _, prompt = prompt.partition("\n")
-                last_refresh_line_end_offsets.append(offset)
-                screen.append(pre_prompt)
-                screeninfo.append((0, []))
-            pos -= ll + 1
-            prompt, lp = self.process_prompt(prompt)
-            l, l2 = disp_str(line)
-            wrapcount = (wlen(l) + lp) // self.console.width
-            if wrapcount == 0:
-                offset += ll + 1  # Takes all of the line plus the newline
-                last_refresh_line_end_offsets.append(offset)
-                screen.append(prompt + l)
-                screeninfo.append((lp, l2))
-            else:
-                i = 0
-                while l:
-                    prelen = lp if i == 0 else 0
-                    index_to_wrap_before = 0
-                    column = 0
-                    for character_width in l2:
-                        if column + character_width >= self.console.width - prelen:
-                            break
-                        index_to_wrap_before += 1
-                        column += character_width
-                    pre = prompt if i == 0 else ""
-                    if len(l) > index_to_wrap_before:
-                        offset += index_to_wrap_before
-                        post = "\\"
-                        after = [1]
-                    else:
-                        offset += index_to_wrap_before + 1  # Takes the newline
-                        post = ""
-                        after = []
-                    last_refresh_line_end_offsets.append(offset)
-                    screen.append(pre + l[:index_to_wrap_before] + post)
-                    screeninfo.append((prelen, l2[:index_to_wrap_before] + after))
-                    l = l[index_to_wrap_before:]
-                    l2 = l2[index_to_wrap_before:]
-                    i += 1
+            offset += index_to_wrap_before
+            last_refresh_line_end_offsets.append(offset)
+            screen.append(prompt + l[:index_to_wrap_before])
+            screeninfo.append((lp, l2[:index_to_wrap_before]))
+            l = l[index_to_wrap_before:]
+            l2 = l2[index_to_wrap_before:]
+            ln += 1 if not prompt_only else 0 
         self.screeninfo = screeninfo
         self.cxy = self.pos2xy()
         if self.msg:
@@ -419,8 +427,7 @@ class Reader:
         self.last_refresh_cache.update_cache(self, screen, screeninfo)
         return screen
 
-    @staticmethod
-    def process_prompt(prompt: str) -> tuple[str, int]:
+    def process_prompt(self, prompt: str) -> tuple[str, int]:
         """Process the prompt.
 
         This means calculate the length of the prompt. The character \x01
@@ -456,6 +463,9 @@ class Reader:
         keep = prompt[pos:]
         l -= sum(map(wlen, ANSI_ESCAPE_SEQUENCE.findall(keep)))
         out_prompt += keep
+
+        if self.can_colorize:
+            out_prompt = f"{ANSIColors.BOLD_MAGENTA}{out_prompt}{ANSIColors.RESET}"
         return out_prompt, l
 
     def bow(self, p: int | None = None) -> int:
@@ -548,8 +558,6 @@ class Reader:
         else:
             prompt = self.ps1
 
-        if self.can_colorize:
-            prompt = f"{ANSIColors.BOLD_MAGENTA}{prompt}{ANSIColors.RESET}"
         return prompt
 
     def push_input_trans(self, itrans: input.KeymapTranslator) -> None:
